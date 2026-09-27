@@ -685,19 +685,38 @@ mod tests {
         events
     }
 
-    /// 回归：解析失败时错误消息截取前 200 字节做预览，多语言输出下必须落在
-    /// char 边界，否则会 panic（与此前 stop 截断 panic 同源）。
+    /// 截断的 JSON（含大量多字节字符）现在应当能被**补全修复**，
+    /// 而不是像旧实现那样直接失败。旧实现无括号补全逻辑，这里必然报错。
     #[tokio::test]
-    async fn execute_tool_repair_preview_does_not_split_multibyte() {
+    async fn execute_tool_repair_repairs_truncated_multibyte() {
+        let expected = "中文".repeat(80);
         let text = format!(
             "{}[{{\"name\": \"f\", \"arguments\": {{\"a\": \"{}\"",
-            tool_parser::TOOL_CALL_START,
-            "中文".repeat(80)
+            tool_parser::TOOL_CALL_START, expected
         );
         let events = make_event_stream(&[(text.as_str(), "RESPONSE")], None);
         let cfg = default_tag_config();
+        let calls = execute_tool_repair(Box::pin(futures::stream::iter(events)), &cfg)
+            .await
+            .expect("截断的 JSON 应当可被修复");
+        assert_eq!(calls.len(), 1);
+        let args = calls[0].function.as_ref().unwrap().arguments.as_str();
+        let v: serde_json::Value = serde_json::from_str(args).expect("arguments 应为合法 JSON");
+        assert_eq!(v.get("a").and_then(|x| x.as_str()), Some(expected.as_str()));
+    }
+
+    /// 回归：错误预览用 `floor_char_boundary` 截断到 200 字节，
+    /// 不得切开多字节字符（否则 panic）。
+    #[tokio::test]
+    async fn execute_tool_repair_error_preview_does_not_split_multibyte() {
+        // 标记内是纯文本而非工具调用 JSON —— 无法修复，必然走错误分支
+        let text = format!("{}{}", tool_parser::TOOL_CALL_START, "中文".repeat(80));
+        let events = make_event_stream(&[(text.as_str(), "RESPONSE")], None);
+        let cfg = default_tag_config();
         let result = execute_tool_repair(Box::pin(futures::stream::iter(events)), &cfg).await;
-        assert!(result.is_err(), "非法 JSON 应返回错误而不是 panic");
+        assert!(result.is_err(), "纯文本不是工具调用，应返回错误而不是 panic");
+        let msg = format!("{}", result.unwrap_err());
+        assert!(msg.contains("无法解析为工具调用"), "错误信息: {msg}");
     }
 
     #[tokio::test]

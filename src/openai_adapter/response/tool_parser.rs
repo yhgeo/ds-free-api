@@ -307,15 +307,13 @@ fn str_has_suspect_control(s: &str) -> bool {
     let b = s.as_bytes();
     let mut i = 0;
     while i < b.len() {
-        match b[i] {
-            b'\t' | 0x08 | 0x0C => return true,
-            b'\r' => {
-                // 孤立的 CR 可疑；CRLF 是正常换行意图，放行
-                if i + 1 >= b.len() || b[i + 1] != b'\n' {
-                    return true;
-                }
-            }
-            _ => {}
+        let c = b[i];
+        if matches!(c, b'\t' | 0x08 | 0x0C) {
+            return true;
+        }
+        // 孤立的 CR 可疑；CRLF 是正常换行意图，放行
+        if c == b'\r' && (i + 1 >= b.len() || b[i + 1] != b'\n') {
+            return true;
         }
         i += 1;
     }
@@ -335,10 +333,10 @@ fn value_has_suspect_control(v: &serde_json::Value) -> bool {
 
 /// 合法 JSON，且未引入可疑控制字符
 fn is_clean_json(s: &str) -> bool {
-    match serde_json::from_str::<serde_json::Value>(s) {
-        Ok(v) => !value_has_suspect_control(&v),
-        Err(_) => false,
-    }
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(s) else {
+        return false;
+    };
+    !value_has_suspect_control(&v)
 }
 
 /// 把字符串字面量内的 `\t` `\b` `\f` `\r`(非 `\r\n`) 还原为字面反斜杠序列。
