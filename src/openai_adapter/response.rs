@@ -692,7 +692,8 @@ mod tests {
         let expected = "中文".repeat(80);
         let text = format!(
             "{}[{{\"name\": \"f\", \"arguments\": {{\"a\": \"{}\"",
-            tool_parser::TOOL_CALL_START, expected
+            tool_parser::TOOL_CALL_START,
+            expected
         );
         let events = make_event_stream(&[(text.as_str(), "RESPONSE")], None);
         let cfg = default_tag_config();
