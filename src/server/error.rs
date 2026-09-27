@@ -152,8 +152,7 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
     let error_type = match err {
         AnthropicCompatError::BadRequest(_) => "invalid_request_error",
         AnthropicCompatError::Overloaded => "overloaded_error",
-        AnthropicCompatError::NoAvailableAccount => "api_error",
-        AnthropicCompatError::Internal(_) => "api_error",
+        AnthropicCompatError::NoAvailableAccount | AnthropicCompatError::Internal(_) => "api_error",
     };
 
     let body = AnthropicErrorBody {
