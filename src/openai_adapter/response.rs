@@ -714,7 +714,10 @@ mod tests {
         let events = make_event_stream(&[(text.as_str(), "RESPONSE")], None);
         let cfg = default_tag_config();
         let result = execute_tool_repair(Box::pin(futures::stream::iter(events)), &cfg).await;
-        assert!(result.is_err(), "纯文本不是工具调用，应返回错误而不是 panic");
+        assert!(
+            result.is_err(),
+            "纯文本不是工具调用，应返回错误而不是 panic"
+        );
         let msg = format!("{}", result.unwrap_err());
         assert!(msg.contains("无法解析为工具调用"), "错误信息: {msg}");
     }
