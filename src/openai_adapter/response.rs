@@ -141,6 +141,14 @@ pub(crate) async fn execute_tool_repair(
     };
 
     let (calls, _) = tool_parser::parse_tool_calls_with(&wrapped, tag_config).ok_or_else(|| {
+        // 诊断：把修复模型的**完整**返回写进日志。旧实现只截断到 200 字节，
+        // 而真凶往往就在 200 字节之后，导致线上问题无法定位。
+        warn!(
+            target: "adapter",
+            "tool_calls repair: 修复模型输出无法解析 (len={}), 原文=\n{}",
+            text.len(),
+            &text[..floor_char_boundary(&text, 16384)]
+        );
         OpenAIAdapterError::Internal(format!(
             "修复模型返回无法解析为工具调用: {}",
             &text[..floor_char_boundary(&text, 200)]
@@ -159,8 +167,14 @@ enum RepairState {
     Forwarding,
     Repairing {
         future: Pin<Box<dyn Future<Output = Result<Vec<ToolCall>, OpenAIAdapterError>> + Send>>,
+        /// 待修复的原始工具调用文本，修复失败时降级为文本返回
+        raw: String,
     },
-    RepairFailed(String),
+    /// 修复失败：保留原始文本以便降级返回，而不是中断整个流
+    RepairFailed {
+        msg: String,
+        raw: String,
+    },
     Done,
 }
 
@@ -218,12 +232,15 @@ impl Stream for RepairStream {
                             );
                             trace!(target: "adapter", ">>> repair: accepting tool_text len={}", tool_text.len());
                             drop(this.inner.as_mut().get_mut().take());
+                            let raw = tool_text.clone();
                             if let Some(f) = this.repair_fn.take() {
                                 let future = f(tool_text);
-                                *this.state = RepairState::Repairing { future };
+                                *this.state = RepairState::Repairing { future, raw };
                             } else {
-                                *this.state =
-                                    RepairState::RepairFailed("no repair function".into());
+                                *this.state = RepairState::RepairFailed {
+                                    msg: "no repair function".into(),
+                                    raw,
+                                };
                             }
                             continue;
                         }
@@ -239,7 +256,7 @@ impl Stream for RepairStream {
                     }
                 }
 
-                RepairState::Repairing { future } => match future.as_mut().poll(cx) {
+                RepairState::Repairing { future, raw } => match future.as_mut().poll(cx) {
                     Poll::Ready(Ok(calls)) => {
                         info!(
                             target: "adapter",
@@ -259,7 +276,11 @@ impl Stream for RepairStream {
                     }
                     Poll::Ready(Err(e)) => {
                         warn!(target: "adapter", "tool_calls repair failed: {}", e);
-                        *this.state = RepairState::RepairFailed(format!("修复失败: {}", e));
+                        let raw = std::mem::take(raw);
+                        *this.state = RepairState::RepairFailed {
+                            msg: format!("修复失败: {e}"),
+                            raw,
+                        };
                         continue;
                     }
                     Poll::Pending => {
@@ -292,9 +313,26 @@ impl Stream for RepairStream {
                     }
                 },
 
-                RepairState::RepairFailed(msg) => {
+                RepairState::RepairFailed { msg, raw } => {
                     let msg = std::mem::take(msg);
-                    return Poll::Ready(Some(Err(OpenAIAdapterError::Internal(msg))));
+                    let raw = std::mem::take(raw);
+                    warn!(
+                        target: "adapter",
+                        "tool_calls 修复失败，降级为文本返回（不再中断流）: {}",
+                        msg
+                    );
+                    // 不再返回 500：把模型原始的工具调用意图作为文本交给客户端，
+                    // 用户至少能看到模型想做什么，而不是一个没有上下文的错误。
+                    let content = format!("[tool_calls 解析失败，以下为模型原始输出]\n{raw}");
+                    *this.state = RepairState::Done;
+                    return Poll::Ready(Some(Ok(converter::make_chunk(
+                        this.model,
+                        Delta {
+                            content: Some(content),
+                            ..Default::default()
+                        },
+                        Some(FINISH_STOP),
+                    ))));
                 }
 
                 RepairState::Done => return Poll::Ready(None),

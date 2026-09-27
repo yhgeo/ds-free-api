@@ -214,34 +214,51 @@ fn is_inside_code_fence(xml: &str, tag_pos: usize) -> bool {
     xml[..tag_pos].matches("```").count() % 2 == 1
 }
 
+/// 只把**非法**转义序列的反斜杠双写。
+///
+/// 关键修正：`\u` 必须后跟 4 位 hex 才算合法转义。旧实现只看首字符是 `u`
+/// 就保留，导致 `C:\users\tea` 这类路径里的 `\u` 被当成 unicode 转义前缀，
+/// 修复后 JSON 依然非法 —— 线上「修复模型返回无法解析为工具调用」的元凶之一。
 fn repair_invalid_backslashes(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.peek() {
-                Some(&next)
-                    if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') =>
-                {
-                    out.push('\\');
-                    out.push(next);
-                    chars.next();
-                }
-                Some(&next) => {
-                    out.push('\\');
-                    out.push('\\');
-                    out.push(next);
-                    chars.next();
-                }
-                None => {
-                    out.push('\\');
-                }
-            }
-        } else {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 16);
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if c != b'\\' {
             out.push(c);
+            i += 1;
+            continue;
+        }
+        if i + 1 >= b.len() {
+            out.push(b'\\');
+            out.push(b'\\');
+            i += 1;
+            continue;
+        }
+        let nx = b[i + 1];
+        if nx == b'u' {
+            if i + 6 <= b.len() && b[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit) {
+                out.push(b'\\');
+                out.push(b'u');
+                i += 2;
+            } else {
+                // 不是合法的 \uXXXX：反斜杠字面化，u 作为普通字符继续处理
+                out.push(b'\\');
+                out.push(b'\\');
+                i += 1;
+            }
+        } else if matches!(nx, b'"' | b'\\' | b'/' | b'b' | b'f' | b'n' | b'r' | b't') {
+            out.push(b'\\');
+            out.push(nx);
+            i += 2;
+        } else {
+            out.push(b'\\');
+            out.push(b'\\');
+            i += 1;
         }
     }
-    out
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
 }
 
 fn repair_unquoted_keys(s: &str) -> String {
@@ -279,14 +296,344 @@ fn repair_unquoted_keys(s: &str) -> String {
     out
 }
 
-fn repair_json(s: &str) -> Option<String> {
-    let step1 = repair_invalid_backslashes(s);
-    if serde_json::from_str::<serde_json::Value>(&step1).is_ok() {
-        return Some(step1);
+// ---------------------------------------------------------------- 路径误解释防护
+
+/// 字符串中是否含可疑控制字符（TAB / BS / FF / 孤立 CR）。
+///
+/// `C:\Users\tea` 在 JSON 语法上完全合法（`\t` 是合法转义），但会被解释成
+/// TAB —— 路径被**静默篡改**，客户端不报错却拿到错误参数。这比解析失败更危险，
+/// 所以修复后要检查有没有引入这类字符，有则回退到字面化方案。
+fn str_has_suspect_control(s: &str) -> bool {
+    let b = s.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'\t' | 0x08 | 0x0C => return true,
+            b'\r' => {
+                // 孤立的 CR 可疑；CRLF 是正常换行意图，放行
+                if i + 1 >= b.len() || b[i + 1] != b'\n' {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
     }
-    let step2 = repair_unquoted_keys(&step1);
-    if serde_json::from_str::<serde_json::Value>(&step2).is_ok() {
-        return Some(step2);
+    false
+}
+
+fn value_has_suspect_control(v: &serde_json::Value) -> bool {
+    match v {
+        serde_json::Value::String(s) => str_has_suspect_control(s),
+        serde_json::Value::Array(a) => a.iter().any(value_has_suspect_control),
+        serde_json::Value::Object(o) => o
+            .iter()
+            .any(|(k, x)| str_has_suspect_control(k) || value_has_suspect_control(x)),
+        _ => false,
+    }
+}
+
+/// 合法 JSON，且未引入可疑控制字符
+fn is_clean_json(s: &str) -> bool {
+    match serde_json::from_str::<serde_json::Value>(s) {
+        Ok(v) => !value_has_suspect_control(&v),
+        Err(_) => false,
+    }
+}
+
+/// 把字符串字面量内的 `\t` `\b` `\f` `\r`(非 `\r\n`) 还原为字面反斜杠序列。
+///
+/// 返回 `(结果, 是否发生改动)`。
+fn dearmor_control_escapes(s: &str) -> (String, bool) {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 16);
+    let mut i = 0;
+    let mut in_str = false;
+    let mut changed = false;
+    while i < b.len() {
+        let c = b[i];
+        if !in_str {
+            out.push(c);
+            if c == b'"' {
+                in_str = true;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\\' && i + 1 < b.len() {
+            let nx = b[i + 1];
+            let suspect = match nx {
+                b't' | b'b' | b'f' => true,
+                // `\r` 后紧跟 `\n` 转义序列 → CRLF 换行意图，保留
+                b'r' => !(i + 4 <= b.len() && b[i + 2] == b'\\' && b[i + 3] == b'n'),
+                _ => false,
+            };
+            if suspect {
+                out.push(b'\\');
+                out.push(b'\\');
+                out.push(nx);
+                changed = true;
+            } else {
+                out.push(b'\\');
+                out.push(nx);
+            }
+            i += 2;
+            continue;
+        }
+        if c == b'"' {
+            in_str = false;
+        }
+        out.push(c);
+        i += 1;
+    }
+    (
+        String::from_utf8(out).unwrap_or_else(|_| s.to_string()),
+        changed,
+    )
+}
+
+/// 文本模式重建 —— 模型没按 JSON 规范转义时的兜底。
+///
+/// - 字符串内的裸反斜杠序列字面化（`C:\Users` → `C:\\Users`）
+/// - 字符串内的真实换行 / 制表符转义成 `\n` / `\t`
+/// - 未转义双引号按**上下文**判定：后面（跳过空白）跟着 `,` `}` `]` `:` 或串尾
+///   才算字符串结束，否则视为内容引号（解决 `print("hello")` 这类）
+fn text_mode_recover(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 32);
+    let mut i = 0;
+    let mut in_str = false;
+    while i < b.len() {
+        let c = b[i];
+        if !in_str {
+            out.push(c);
+            if c == b'"' {
+                in_str = true;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'\\' {
+            if i + 1 >= b.len() {
+                out.push(b'\\');
+                out.push(b'\\');
+                i += 1;
+                continue;
+            }
+            let nx = b[i + 1];
+            if nx == b'u' && i + 6 <= b.len() && b[i + 2..i + 6].iter().all(u8::is_ascii_hexdigit) {
+                out.push(b'\\');
+                out.push(b'u');
+                i += 2;
+                continue;
+            }
+            if matches!(nx, b'"' | b'\\' | b'/' | b'n') {
+                out.push(b'\\');
+                out.push(nx);
+                i += 2;
+                continue;
+            }
+            if nx == b'r' && i + 4 <= b.len() && b[i + 2] == b'\\' && b[i + 3] == b'n' {
+                out.push(b'\\');
+                out.push(b'r');
+                i += 2;
+                continue;
+            }
+            // 裸反斜杠 → 字面化
+            out.push(b'\\');
+            out.push(b'\\');
+            out.push(nx);
+            i += 2;
+            continue;
+        }
+        match c {
+            b'\n' => {
+                out.extend_from_slice(b"\\n");
+                i += 1;
+            }
+            b'\r' => {
+                out.extend_from_slice(b"\\r");
+                i += 1;
+            }
+            b'\t' => {
+                out.extend_from_slice(b"\\t");
+                i += 1;
+            }
+            b'"' => {
+                let mut j = i + 1;
+                while j < b.len() && matches!(b[j], b' ' | b'\t' | b'\r' | b'\n') {
+                    j += 1;
+                }
+                let closes = j >= b.len() || matches!(b[j], b',' | b'}' | b']' | b':');
+                if closes {
+                    out.push(b'"');
+                    in_str = false;
+                } else {
+                    out.push(b'\\');
+                    out.push(b'"');
+                }
+                i += 1;
+            }
+            _ => {
+                if c.is_ascii_control() {
+                    out.extend_from_slice(format!("\\u{c:04x}").as_bytes());
+                } else {
+                    out.push(c);
+                }
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// 补全被截断的 JSON：闭合未结束的字符串、补齐括号栈、补缺失的值。
+///
+/// 模型输出中途结束（token 上限、流被切断）时，旧实现直接放弃修复并返回 500。
+fn balance_brackets(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(b.len() + 16);
+    let mut stack: Vec<u8> = Vec::new();
+    let mut in_str = false;
+    let mut i = 0;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' && i + 1 < b.len() {
+                out.push(c);
+                out.push(b[i + 1]);
+                i += 2;
+                continue;
+            }
+            out.push(c);
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        match c {
+            b'"' => {
+                in_str = true;
+                out.push(c);
+            }
+            b'{' | b'[' => {
+                stack.push(c);
+                out.push(c);
+            }
+            b'}' | b']' => {
+                stack.pop();
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+        i += 1;
+    }
+    if in_str {
+        out.push(b'"');
+    }
+    // 值缺失兜底：`{"a":` 或 `[1,` 结尾时补 null，否则补出的 JSON 仍非法
+    let mut tail = out.len();
+    while tail > 0 && out[tail - 1].is_ascii_whitespace() {
+        tail -= 1;
+    }
+    if tail > 0 && (out[tail - 1] == b':' || out[tail - 1] == b',') {
+        out.extend_from_slice(b"null");
+    }
+    while let Some(op) = stack.pop() {
+        out.push(if op == b'{' { b'}' } else { b']' });
+    }
+    String::from_utf8(out).unwrap_or_else(|_| s.to_string())
+}
+
+/// 从 `s` 中提取第一个配平区间 `[start, end)`（含 open / close 自身）。
+///
+/// 未闭合（截断）时返回 `end = s.len()`。替代 `find(open)` + `rfind(close)`
+/// 的粗暴提取 —— 后者在字符串内容含 `]` 时会切错位置。
+fn find_balanced(s: &str, open: u8, close: u8) -> Option<(usize, usize)> {
+    let b = s.as_bytes();
+    let start = b.iter().position(|&c| c == open)?;
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut i = start;
+    while i < b.len() {
+        let c = b[i];
+        if in_str {
+            if c == b'\\' {
+                i += 2;
+                continue;
+            }
+            if c == b'"' {
+                in_str = false;
+            }
+            i += 1;
+            continue;
+        }
+        if c == b'"' {
+            in_str = true;
+            i += 1;
+            continue;
+        }
+        if c == open {
+            depth += 1;
+        } else if c == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some((start, i + 1));
+            }
+        }
+        i += 1;
+    }
+    Some((start, b.len()))
+}
+
+/// 对候选叠加 裸键名修复 / 括号补全，按改动量从小到大产出
+fn layered(c: &str) -> [String; 4] {
+    let uq = repair_unquoted_keys(c);
+    let bal = balance_brackets(c);
+    let bal_uq = balance_brackets(&uq);
+    [c.to_string(), uq, bal, bal_uq]
+}
+
+/// JSON 修复主入口 —— 多候选尝试，返回第一个可用结果。
+///
+/// 候选优先级（原样失败时）：
+///   1. `repair_invalid_backslashes` —— 只修非法转义，保留合法转义（最保守）
+///   2. `text_mode_recover`         —— 状态机重建（字面化裸反斜杠 + 引号上下文判定）
+///   3. 全量反斜杠双写              —— 模型完全没转义时的兜底
+///
+/// 每个候选都优先选择「合法且未引入可疑控制字符」的结果，避免 Windows 路径
+/// 被静默解释成 TAB / 退格等控制字符。
+fn repair_json(s: &str) -> Option<String> {
+    // 0. 原样合法 —— 但先检查是否被"路径误解释"
+    if serde_json::from_str::<serde_json::Value>(s).is_ok() {
+        let (dearmored, changed) = dearmor_control_escapes(s);
+        if changed && serde_json::from_str::<serde_json::Value>(&dearmored).is_ok() {
+            return Some(dearmored);
+        }
+        return Some(s.to_string());
+    }
+
+    let step1 = repair_invalid_backslashes(s);
+    let text_mode = text_mode_recover(s);
+    let literal = s.replace('\\', "\\\\");
+    let cands = [&step1, &text_mode, &literal];
+
+    // 1. 优先取「合法且无控制字符」的候选
+    for c in cands.iter() {
+        for cand in layered(c) {
+            if is_clean_json(&cand) {
+                return Some(cand);
+            }
+        }
+    }
+    // 2. 放宽限制，允许控制字符（模型确实想要 TAB 的罕见场景）
+    for c in cands.iter() {
+        for cand in layered(c) {
+            if serde_json::from_str::<serde_json::Value>(&cand).is_ok() {
+                return Some(cand);
+            }
+        }
     }
     None
 }
@@ -311,9 +658,8 @@ pub fn parse_tool_calls_with(xml: &str, cfg: &TagConfig) -> Option<(Vec<ToolCall
     };
     let inner = &xml[after_start..inner_end];
 
-    let arr = match inner.find('[') {
-        Some(arr_start) => {
-            let arr_end = inner.rfind(']').map(|p| p + 1).unwrap_or(inner.len());
+    let arr = match find_balanced(inner, b'[', b']') {
+        Some((arr_start, arr_end)) => {
             let json_str = &inner[arr_start..arr_end];
             if json_str.trim() == "[]" {
                 return None;
@@ -1035,5 +1381,110 @@ mod tests {
             delta.tool_calls
         );
         assert!(delta.content.is_none(), "保活心跳不得携带 content");
+    }
+
+    // ---------- 修复管道回归（对应线上「修复模型返回无法解析为工具调用」） ----------
+
+    /// 取出修复结果中第一个工具调用的 command 参数
+    fn command_of(raw: &str) -> String {
+        let fixed = repair_json(raw).expect("修复失败");
+        let v: serde_json::Value = serde_json::from_str(&fixed).expect("修复结果不是合法 JSON");
+        let item = match &v {
+            serde_json::Value::Array(a) => a.first().cloned().expect("空数组"),
+            other => other.clone(),
+        };
+        let args = item.get("arguments").expect("缺少 arguments");
+        let obj = match args {
+            serde_json::Value::String(s) => serde_json::from_str::<serde_json::Value>(s).unwrap(),
+            other => other.clone(),
+        };
+        obj.get("command")
+            .and_then(|c| c.as_str())
+            .expect("缺少 command")
+            .to_string()
+    }
+
+    /// 单反斜杠大写路径：旧实现静默把 `\t` 解释成 TAB，路径被悄悄改掉
+    #[test]
+    fn repair_single_backslash_upper_path() {
+        assert_eq!(
+            command_of(r#"[{"name":"pwsh","arguments":{"command":"C:\Users\tea"}}]"#),
+            r"C:\Users\tea"
+        );
+    }
+
+    /// 单反斜杠小写路径：旧实现因 `\u` 误判（只看首字符不校验 4 位 hex）直接失败
+    #[test]
+    fn repair_single_backslash_lower_path() {
+        assert_eq!(
+            command_of(r#"[{"name":"pwsh","arguments":{"command":"C:\users\tea"}}]"#),
+            r"C:\users\tea"
+        );
+    }
+
+    /// 路径中同时含 `\t` 与 `\f`，两者都是合法 JSON 转义 —— 最隐蔽的静默损坏
+    #[test]
+    fn repair_path_with_t_and_f() {
+        assert_eq!(
+            command_of(r#"[{"name":"pwsh","arguments":{"command":"C:\temp\file.txt"}}]"#),
+            r"C:\temp\file.txt"
+        );
+    }
+
+    /// 字符串内未转义双引号
+    #[test]
+    fn repair_unescaped_inner_quotes() {
+        assert_eq!(
+            command_of(r#"[{"name":"pwsh","arguments":{"command":"print("hello")"}}]"#),
+            r#"print("hello")"#
+        );
+    }
+
+    /// 截断的 JSON 必须能补全
+    #[test]
+    fn repair_truncated_json() {
+        let raw = r#"[{"name":"pwsh","arguments":{"command":"import os\np = r"#;
+        let fixed = repair_json(raw).expect("截断修复失败");
+        assert!(serde_json::from_str::<serde_json::Value>(&fixed).is_ok());
+    }
+
+    /// 合法 JSON 必须原样返回（含 CRLF 与 \uXXXX）
+    #[test]
+    fn repair_keeps_valid_json() {
+        let raw = r#"[{"name":"pwsh","arguments":{"command":"a\r\nb\u4e2d"}}]"#;
+        assert_eq!(repair_json(raw).as_deref(), Some(raw));
+    }
+
+    /// 修复必须幂等（二次修复不得再改动）
+    #[test]
+    fn repair_is_idempotent() {
+        let raw = r#"[{"name":"pwsh","arguments":{"command":"C:\Users\tea"}}]"#;
+        let once = repair_json(raw).unwrap();
+        let twice = repair_json(&once).unwrap();
+        assert_eq!(once, twice);
+    }
+
+    /// 配平扫描：字符串内的 `]` 不得截断区间
+    #[test]
+    fn find_balanced_ignores_bracket_in_string() {
+        let s = r#"[{"name":"pwsh","arguments":{"command":"echo ] done"}}]"#;
+        let (a, b) = find_balanced(s, b'[', b']').unwrap();
+        assert_eq!(&s[a..b], s);
+    }
+
+    /// 配平扫描：截断时返回剩余全部
+    #[test]
+    fn find_balanced_truncated() {
+        let s = r#"[{"a":1"#;
+        let (a, b) = find_balanced(s, b'[', b']').unwrap();
+        assert_eq!((a, b), (0, s.len()));
+    }
+
+    /// dearmor 不得改动 CRLF 换行
+    #[test]
+    fn dearmor_keeps_crlf() {
+        let (out, changed) = dearmor_control_escapes(r#""a\r\nb""#);
+        assert!(!changed);
+        assert_eq!(out, r#""a\r\nb""#);
     }
 }

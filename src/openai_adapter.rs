@@ -560,13 +560,24 @@ impl OpenAIAdapter {
                 if !tools_info.is_empty() {
                     prompt.push_str(&format!("可用的工具定义：\n{}\n\n", tools_info));
                 }
-                prompt.push_str(&format!(
-                    "请将以下代码块中的内容提取并转换为合法的工具调用 JSON 数组。\
-                     \n每个元素必须包含 \"name\"（字符串）和 \"arguments\"（对象）字段。\
-                     \n只输出 JSON 数组本身，不要加 code fence，不要其他文字解释。\
-                     \n注意：字符串值中的引号和换行符必须用反斜杠转义（如 \\\" 和 \\n）。\
-                     \n\n需要修复的内容：\n~~~\n{tool_text}\n~~~"
-                ));
+                prompt.push_str(
+                    "请把下面 ~~~ 之间内容里的工具调用，提取成一个合法的 JSON 数组。\n\
+                     \n\
+                     严格规则（务必遵守）：\n\
+                     1. 只输出 JSON 数组本身。不要 code fence，不要任何解释文字。\n\
+                     2. 每个元素形如 {\"name\": \"工具名\", \"arguments\": {...}}。\n\
+                     3. 反斜杠必须写成双反斜杠。Windows 路径 C:\\Users\\tea 要写成 \"C:\\\\Users\\\\tea\"。\n\
+                     4. 字符串内的双引号必须转义为 \\\"。\n\
+                     5. 换行必须写成 \\n，不要真的换行。\n\
+                     \n\
+                     示例（输入是 Windows 路径，输出必须双写反斜杠）：\n\
+                     输入: {\"name\": \"pwsh\", \"arguments\": {\"command\": \"cd C:\\temp\"}}\n\
+                     输出: [{\"name\": \"pwsh\", \"arguments\": {\"command\": \"cd C:\\\\temp\"}}]\n\
+                     \n\
+                     需要修复的内容：\n~~~\n",
+                );
+                prompt.push_str(&tool_text);
+                prompt.push_str("\n~~~");
                 let req = ChatRequest {
                     prompt,
                     thinking_enabled: false,
