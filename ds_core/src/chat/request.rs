@@ -147,6 +147,8 @@ impl Chat {
                 .await
             {
                 Ok(resp) => return Ok(resp),
+                // 账号池已无可能恢复的账号：确定性失败，退避重试无意义，立即返回
+                Err(CoreError::NoAvailableAccount) => return Err(CoreError::NoAvailableAccount),
                 Err(CoreError::Overloaded) => {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
@@ -193,6 +195,8 @@ impl Chat {
                 .await
             {
                 Ok(resp) => return Ok(resp),
+                // 账号池已无可能恢复的账号：确定性失败，退避重试无意义，立即返回
+                Err(CoreError::NoAvailableAccount) => return Err(CoreError::NoAvailableAccount),
                 Err(CoreError::Overloaded) => {
                     if attempt + 1 >= MAX_ATTEMPTS {
                         return Err(CoreError::Overloaded);
@@ -229,9 +233,9 @@ impl Chat {
             .ok_or_else(|| {
                 log::warn!(
                     target: "ds_core::accounts",
-                    "req={} 账号池无可用账号", request_id
+                    "req={} 账号池无可用账号（确定性失败，不重试）", request_id
                 );
-                CoreError::Overloaded
+                CoreError::NoAvailableAccount
             })?;
         let account = guard.account();
         let account_id = account.display_id().to_string();
@@ -511,9 +515,9 @@ impl Chat {
         .ok_or_else(|| {
             log::warn!(
                 target: "ds_core::accounts",
-                "req={} 账号池无可用账号", request_id
+                "req={} 账号池无可用账号（确定性失败，不重试）", request_id
             );
-            CoreError::Overloaded
+            CoreError::NoAvailableAccount
         })?;
 
         let account = guard.account();

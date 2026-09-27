@@ -98,6 +98,8 @@ pub enum AnthropicCompatError {
     BadRequest(String),
     #[error("service overloaded")]
     Overloaded,
+    #[error("no usable account in pool")]
+    NoAvailableAccount,
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -107,6 +109,7 @@ impl From<OpenAIAdapterError> for AnthropicCompatError {
         match e {
             OpenAIAdapterError::BadRequest(msg) => Self::BadRequest(msg),
             OpenAIAdapterError::Overloaded => Self::Overloaded,
+            OpenAIAdapterError::NoAvailableAccount => Self::NoAvailableAccount,
             OpenAIAdapterError::ProviderError(msg)
             | OpenAIAdapterError::Internal(msg)
             | OpenAIAdapterError::ToolCallRepairNeeded(msg) => Self::Internal(msg),
@@ -121,7 +124,23 @@ impl AnthropicCompatError {
         match self {
             Self::BadRequest(_) => 400,
             Self::Overloaded => 429,
+            Self::NoAvailableAccount => 503,
             Self::Internal(_) => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{AnthropicCompatError, OpenAIAdapterError};
+
+    #[test]
+    fn no_available_account_maps_to_503() {
+        let err = AnthropicCompatError::from(OpenAIAdapterError::NoAvailableAccount);
+        assert!(
+            matches!(err, AnthropicCompatError::NoAvailableAccount),
+            "Anthropic 侧同样要保留独立变体，避免退化成 500"
+        );
+        assert_eq!(err.status_code(), 503, "池空是确定性失败，应返回 503");
     }
 }

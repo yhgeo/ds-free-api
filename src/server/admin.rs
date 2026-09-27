@@ -320,7 +320,10 @@ pub(crate) async fn admin_sessions(
             };
             json_response(&resp)
         }
-        Err(crate::openai_adapter::OpenAIAdapterError::Overloaded) => error_response(
+        Err(
+            crate::openai_adapter::OpenAIAdapterError::Overloaded
+            | crate::openai_adapter::OpenAIAdapterError::NoAvailableAccount,
+        ) => error_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "没有可用账号：账号池中所有账号均不可用（可能全部被禁言或初始化失败）。\
              会话列表只从健康账号读取。",

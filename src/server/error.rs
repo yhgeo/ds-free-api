@@ -100,6 +100,7 @@ fn openai_error_response(err: &ServerError) -> Response {
             let (error_type, code) = match e {
                 OpenAIAdapterError::BadRequest(_) => ("invalid_request_error", "bad_request"),
                 OpenAIAdapterError::Overloaded => ("server_error", "overloaded"),
+                OpenAIAdapterError::NoAvailableAccount => ("server_error", "no_available_account"),
                 OpenAIAdapterError::ProviderError(_) => ("server_error", "provider_error"),
                 OpenAIAdapterError::Internal(_) | OpenAIAdapterError::ToolCallRepairNeeded(_) => {
                     ("server_error", "internal_error")
@@ -151,6 +152,7 @@ fn anthropic_error_response(err: &AnthropicCompatError) -> Response {
     let error_type = match err {
         AnthropicCompatError::BadRequest(_) => "invalid_request_error",
         AnthropicCompatError::Overloaded => "overloaded_error",
+        AnthropicCompatError::NoAvailableAccount => "api_error",
         AnthropicCompatError::Internal(_) => "api_error",
     };
 

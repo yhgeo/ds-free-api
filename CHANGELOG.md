@@ -4,6 +4,35 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.4.2] - 2026-09-28
+
+### Fixed
+
+- **工具调用标签模糊匹配加固** —— 内置归一化此前只覆盖 2 个字符
+  （全角 `｜`→`|`、`▁`→`_`），模型输出其它回退形态一律识别不了，
+  只能靠用户在配置里逐个补 `extra_starts` / `extra_ends`。现扩展字符归一化表
+  并加入 ASCII 大小写折叠：
+  - 新增全角下划线 `＿`(U+FF3F)、全角尖括号 `＜`(U+FF1C) / `＞`(U+FF1E)
+  - 连字符族统一：`-` / `‐`(U+2010) / `‑`(U+2011) / `–`(U+2013) / `—`(U+2014)
+  - 开始 / 结束标签判定改为「归一化 + 转小写」后比较，
+    `<|tool_Calls_Begin|>` 这类大小写变体现在也能命中
+  - 修掉 `find_end_tag_with` 的字节切片隐患：归一化后首字符可能是 3 字节的
+    全角 `＜`，旧实现按 `&open_tag[1..]` 剥离会 panic
+  - 新增 3 组单元测试覆盖全角下划线 / 全角尖括号 / 大小写变体
+- **账号池无可用账号时快速失败（HTTP 503）** —— 旧实现把「池里没有可用账号」
+  与「上游限流」混用同一个 `CoreError::Overloaded`，于是一个确定性失败也要走完
+  整轮退避重试，客户端只能等到自己超时（表现为 HTTP 000 / 0 字节 / 30–45 秒）。
+  现在按语义拆分：
+  - 新增 `CoreError::NoAvailableAccount`：**确定性**失败 —— 池内账号全部
+    `Invalid`（被禁言 / 连续登录失败），等待与重试都不会改变结果。
+    配套新增 `AccountPool::has_recoverable_account()` 短路，
+    `get_account_with_wait` 不再白等满 `timeout_ms`
+  - 该错误跳过所有重试，直接映射为 HTTP **503**，OpenAI 错误码
+    `no_available_account`；Anthropic 侧同步新增变体（503 / `api_error`）
+  - `CoreError::Overloaded` 语义收窄为**瞬时**状态（账号都在忙 / 上游
+    `rate_limit_reached`），保持 429 + 退避重试不变
+  - 新增单元测试固定「503 vs 429」的映射契约与池内可恢复性判定
+
 ## [0.4.1] - 2026-09-28
 
 ### Fixed

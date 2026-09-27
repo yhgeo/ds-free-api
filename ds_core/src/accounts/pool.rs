@@ -484,17 +484,37 @@ impl AccountPool {
     }
 
     /// 获取空闲最久的可用账号，带等待：无可用账号时最多等待 `timeout_ms` 毫秒
+    ///
+    /// 若池内已不存在任何「可能恢复」的账号（只剩 `Invalid`），等待不会改变结果，
+    /// 此时立即返回 —— 否则客户端要白等满 `timeout_ms` 才拿到错误。
     pub async fn get_account_with_wait(&self, timeout_ms: u64) -> Option<AccountGuard> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
         loop {
             if let Some(g) = self.get_account() {
                 return Some(g);
             }
+            if !self.has_recoverable_account() {
+                debug!(
+                    target: "ds_core::accounts",
+                    "账号池已无可能恢复的账号（全部 Invalid），立即失败而不等待"
+                );
+                return None;
+            }
             if tokio::time::Instant::now() >= deadline {
                 return None;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
+    }
+
+    /// 池内是否存在「仍可能恢复」的账号。
+    ///
+    /// `Invalid` 是终态（账号被禁言 / 连续登录失败），重启或人工干预前不会自愈；
+    /// `Idle` / `Busy` / `Error` 都还有机会（`Error` 由后台任务重登）。
+    fn has_recoverable_account(&self) -> bool {
+        self.accounts
+            .iter()
+            .any(|entry| entry.value().state() != AccountState::Invalid)
     }
 
     /// 获取空闲最久的可用账号（不等待，立即返回）
@@ -1081,5 +1101,30 @@ mod tests {
             }
         }
         assert!(by_device.is_empty());
+    }
+
+    #[test]
+    fn pool_of_only_invalid_accounts_is_not_recoverable() {
+        let pool = AccountPool::new(0);
+        pool.accounts.insert(
+            "a@example.com".to_string(),
+            Arc::new(Account::new_invalid(account("a@example.com", "dev"), 0)),
+        );
+        assert!(
+            !pool.has_recoverable_account(),
+            "全部 Invalid（被禁言 / 连续登录失败）时不应等待，应让请求立即失败"
+        );
+    }
+
+    #[test]
+    fn pool_with_non_invalid_account_is_recoverable() {
+        let pool = AccountPool::new(0);
+        let a = idle_account("a@example.com");
+        a.state.store(AccountState::Error as u8, Ordering::Relaxed);
+        pool.accounts.insert("a@example.com".to_string(), a);
+        assert!(
+            pool.has_recoverable_account(),
+            "Error 账号由后台重登任务处理，仍应视为可恢复"
+        );
     }
 }

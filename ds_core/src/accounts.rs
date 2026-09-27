@@ -101,7 +101,7 @@ impl Accounts {
             .pool
             .get_account_with_wait(5000)
             .await
-            .ok_or(CoreError::Overloaded)?;
+            .ok_or(CoreError::NoAvailableAccount)?;
         let token = guard.account().token();
         self.client
             .read()

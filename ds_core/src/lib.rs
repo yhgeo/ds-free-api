@@ -19,9 +19,18 @@ use std::sync::Arc;
 /// 内核层错误类型
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
-    /// 服务过载：所有账号都在忙或不健康
+    /// 服务过载：账号池暂时没有空闲账号（可能都在忙），或上游返回限流。
+    ///
+    /// 属于**可恢复**的瞬时状态，值得退避重试。
     #[error("no available account")]
     Overloaded,
+
+    /// 账号池中已无任何可用账号（全部被禁言 / 失效 / 初始化失败）。
+    ///
+    /// 与 `Overloaded` 的区别在于这是**确定性**状态：等待或重试都不会改变结果，
+    /// 因此不参与退避重试，直接映射为 HTTP 503。
+    #[error("no usable account in pool")]
+    NoAvailableAccount,
 
     /// PoW 计算失败
     #[error("proof of work failed: {0}")]

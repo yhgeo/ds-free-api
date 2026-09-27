@@ -59,7 +59,7 @@ match_bool = "deny"
 
 [package]
 name = "ds-free-api"
-version = "0.4.1"
+version = "0.4.2"
 license = "GPL-3.0-only"
 edition = "2024"
 

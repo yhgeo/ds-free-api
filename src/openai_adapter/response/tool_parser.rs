@@ -46,18 +46,30 @@ impl TagConfig {
     }
 }
 
-/// 标签字符归一化：`｜`(U+FF5C) → `|`，`▁`(U+2581) → `_`
+/// 标签字符归一化 —— 覆盖常见「全角 / 异体字符」幻觉。
+///
+/// 模型在中文输入法或复制粘贴场景下会把 ASCII 标签打成全角形态，
+/// 归一化后即可与内置标签做字符级等价比较：
+///
+/// - `｜`(U+FF5C) → `|`、`▁`(U+2581) → `_`（原有）
+/// - `＿`(U+FF3F，全角下划线) → `_` —— 与 `▁` 是两个不同码位，都要覆盖
+/// - `＜`(U+FF1C) / `＞`(U+FF1E) 全角尖括号 → `<` / `>`
+/// - 各类 Unicode 连字符（全角减号 / 连字符 / 短破折号 / 长破折号）→ `-`
 fn norm_tag_char(c: char) -> char {
     match c {
         '\u{FF5C}' => '|',
-        '\u{2581}' => '_',
+        '\u{2581}' | '\u{FF3F}' => '_',
+        '\u{FF1C}' => '<',
+        '\u{FF1E}' => '>',
+        '\u{FF0D}' | '\u{2010}' | '\u{2011}' | '\u{2013}' | '\u{2014}' => '-',
         _ => c,
     }
 }
 
-/// 标签字符等价判断
+/// 标签字符等价判断：归一化后相等，或仅 ASCII 大小写不同
 fn eq_tag_char(a: char, b: char) -> bool {
-    a == b || norm_tag_char(a) == norm_tag_char(b)
+    let (na, nb) = (norm_tag_char(a), norm_tag_char(b));
+    na == nb || na.eq_ignore_ascii_case(&nb)
 }
 
 /// 模糊匹配标签：在 `haystack` 中查找 `partial`，支持 `｜`↔`|`、`▁`↔`_` 等价
@@ -129,7 +141,9 @@ pub(crate) fn find_end_tag_with<'a>(
     let search = &s[from..];
     if let Some(st) = start_tag {
         let open_tag = st.trim_end_matches('>');
-        let close_tag = format!("</{}>", &open_tag[1..]);
+        // 首字符可能是全角 `＜`（3 字节）——必须按字符剥离，不能 `&open_tag[1..]`
+        let rest = open_tag.trim_start_matches(|c: char| norm_tag_char(c) == '<');
+        let close_tag = format!("</{rest}>");
         if let Some(pos) = search.find(&close_tag) {
             let abs = from + pos;
             return Some((abs, &s[abs..abs + close_tag.len()]));
@@ -172,21 +186,34 @@ pub(crate) fn find_end_tag_with<'a>(
 }
 
 fn is_start_tag(tag: &str, cfg: &TagConfig) -> bool {
-    if !tag.starts_with('<') {
+    // 归一化后再比较：全角尖括号 / 大小写变体同样要认出来
+    let Some(first) = tag.chars().next() else {
+        return false;
+    };
+    if norm_tag_char(first) != '<' {
         return false;
     }
+    let tag_norm = tag
+        .chars()
+        .map(norm_tag_char)
+        .collect::<String>()
+        .to_ascii_lowercase();
     let partial = TOOL_CALL_START.trim_end_matches('>');
-    let tag_norm: String = tag.chars().map(norm_tag_char).collect();
-    let partial_norm: String = partial.chars().map(norm_tag_char).collect();
+    let partial_norm = partial
+        .chars()
+        .map(norm_tag_char)
+        .collect::<String>()
+        .to_ascii_lowercase();
     if partial_norm.starts_with(&tag_norm) || tag_norm.starts_with(&partial_norm) {
         return true;
     }
     for start in &cfg.starts {
-        let p: String = start
+        let p = start
             .trim_end_matches('>')
             .chars()
             .map(norm_tag_char)
-            .collect();
+            .collect::<String>()
+            .to_ascii_lowercase();
         if p.starts_with(&tag_norm) || tag_norm.starts_with(&p) {
             return true;
         }
@@ -1336,6 +1363,37 @@ mod tests {
         // （ASCII _ + ▁ + 全角 ｜），验证模糊匹配能识别
         let xml = format!(
             r#"{TOOL_CALL_START}[{{"name": "get_weather", "arguments": {{"city": "北京"}}}}]<|tool_calls▁end｜>"#
+        );
+        let (calls, _) = parse_tool_calls(&xml).unwrap();
+        assert_eq!(calls.len(), 1);
+    }
+
+    #[test]
+    fn fuzzy_match_fullwidth_and_case_variants() {
+        // 中文输入法 / 复制粘贴场景下的标签幻觉：全角下划线（U+FF3F）、
+        // 全角尖括号（U+FF1C/U+FF1E）、驼峰大小写 —— 归一化后应全部识别
+        let variants = [
+            "<|tool\u{FF3F}calls\u{FF3F}begin|>",
+            "\u{FF1C}|tool_calls_begin|\u{FF1E}",
+            "<|tool_Calls_Begin|>",
+            "<|tool_calls_begin|>",
+        ];
+        for start in variants {
+            let xml = format!(
+                r#"{start}[{{"name": "get_weather", "arguments": {{"city": "北京"}}}}]<|tool_calls_end|>"#
+            );
+            let Some((calls, _)) = parse_tool_calls(&xml) else {
+                panic!("开始标签变体未被识别: {start}");
+            };
+            assert_eq!(calls.len(), 1, "开始标签变体解析结果不正确: {start}");
+        }
+    }
+
+    #[test]
+    fn fuzzy_match_fullwidth_end_tag() {
+        // 结束标签同样要能吃全角下划线与全角尖括号
+        let xml = format!(
+            "{TOOL_CALL_START}[{{\"name\": \"get_weather\", \"arguments\": {{}}}}]\u{FF1C}|tool\u{FF3F}calls\u{FF3F}end|\u{FF1E}"
         );
         let (calls, _) = parse_tool_calls(&xml).unwrap();
         assert_eq!(calls.len(), 1);

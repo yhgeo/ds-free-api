@@ -610,6 +610,12 @@ pub enum OpenAIAdapterError {
     #[error("service overloaded")]
     Overloaded,
 
+    /// 账号池中已无任何可用账号（全部被禁言 / 失效 / 初始化失败）
+    ///
+    /// 与 `Overloaded` 的区别：这是**确定性**状态，重试不会改变结果，映射为 HTTP 503。
+    #[error("no usable account in pool")]
+    NoAvailableAccount,
+
     /// 上游提供商错误（网络、业务错误等）
     #[error("provider error: {0}")]
     ProviderError(String),
@@ -627,6 +633,7 @@ impl From<CoreError> for OpenAIAdapterError {
     fn from(e: CoreError) -> Self {
         match e {
             CoreError::Overloaded => Self::Overloaded,
+            CoreError::NoAvailableAccount => Self::NoAvailableAccount,
             CoreError::ProofOfWorkFailed(err) => {
                 Self::Internal(format!("proof of work failed: {}", err))
             }
@@ -649,8 +656,35 @@ impl OpenAIAdapterError {
         match self {
             Self::BadRequest(_) => 400,
             Self::Overloaded => 429,
+            Self::NoAvailableAccount => 503,
             Self::ProviderError(_) => 502,
             Self::Internal(_) | Self::ToolCallRepairNeeded(_) => 500,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpenAIAdapterError;
+    use ds_core::CoreError;
+
+    #[test]
+    fn no_available_account_maps_to_503() {
+        let err = OpenAIAdapterError::from(CoreError::NoAvailableAccount);
+        assert!(
+            matches!(err, OpenAIAdapterError::NoAvailableAccount),
+            "账号池确定性失败应保留独立变体，不能与可重试的 Overloaded 混用"
+        );
+        assert_eq!(err.status_code(), 503, "池空是确定性失败，应返回 503");
+    }
+
+    #[test]
+    fn overloaded_still_maps_to_429() {
+        let err = OpenAIAdapterError::from(CoreError::Overloaded);
+        assert_eq!(
+            err.status_code(),
+            429,
+            "上游限流仍是瞬时状态，应保持 429 让客户端退避重试"
+        );
     }
 }
